@@ -338,4 +338,225 @@
         (< new-drop-total (/ (* new-total-volume u8) u10))))))
 
 ;; public functions
-;;
+
+;; Core betting functions
+
+;; Place a new bet on STX price prediction
+(define-public (place-bet (amount uint) (prediction uint) (duration uint) (current-price uint))
+  (let ((bet-id (generate-bet-id))
+        (end-time (calculate-end-time duration)))
+    (asserts! (is-contract-active) ERR_UNAUTHORIZED)
+    (asserts! (is-valid-bet-amount amount) ERR_INVALID_BET_AMOUNT)
+    (asserts! (is-valid-duration duration) ERR_INVALID_DURATION)
+    (asserts! (is-valid-prediction prediction) ERR_INVALID_PREDICTION)
+    (asserts! (is-bet-safe-for-pool prediction amount) ERR_INVALID_BET_AMOUNT)
+    
+    ;; Transfer STX from user to contract
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    
+    ;; Store the bet
+    (map-set bets { bet-id: bet-id }
+      {
+        bettor: tx-sender,
+        amount: amount,
+        prediction: prediction,
+        start-price: current-price,
+        target-price: none,
+        start-time: (get-current-timestamp),
+        end-time: end-time,
+        duration: duration,
+        outcome: BET_OUTCOME_PENDING,
+        resolved: false,
+        resolved-at: none,
+        payout: u0
+      })
+    
+    ;; Update various tracking data
+    (update-user-stats-on-bet tx-sender amount)
+    (update-daily-pool prediction amount)
+    (update-global-stats amount)
+    (add-user-active-bet tx-sender bet-id)
+    
+    ;; Store current price data
+    (store-price-data current-price (get-current-timestamp))
+    
+    (ok bet-id)))
+
+;; Resolve an expired bet
+(define-public (resolve-bet (bet-id uint) (final-price uint))
+  (let ((bet-data (unwrap! (map-get? bets { bet-id: bet-id }) ERR_BET_NOT_FOUND)))
+    (asserts! (can-resolve-bet bet-data) ERR_BET_NOT_EXPIRED)
+    
+    (let ((outcome (determine-bet-outcome (get start-price bet-data) final-price (get prediction bet-data)))
+          (bet-amount (get amount bet-data))
+          (bettor (get bettor bet-data)))
+      
+      (let ((payout (if (is-eq outcome BET_OUTCOME_WIN)
+                      (calculate-payout bet-amount true)
+                      (if (is-eq outcome BET_OUTCOME_DRAW)
+                        bet-amount ;; Return original bet on draw
+                        u0))))
+        
+        ;; Update bet with resolution data
+        (map-set bets { bet-id: bet-id }
+          (merge bet-data {
+            target-price: (some final-price),
+            outcome: outcome,
+            resolved: true,
+            resolved-at: (some (get-current-timestamp)),
+            payout: payout
+          }))
+        
+        ;; Update user stats
+        (update-user-stats-on-resolution bettor outcome payout bet-amount)
+        
+        ;; Remove from active bets
+        (remove-user-active-bet bettor bet-id)
+        
+        ;; Handle payouts and house edge
+        (if (> payout u0)
+          (begin
+            ;; Pay the user
+            (try! (as-contract (stx-transfer? payout tx-sender bettor)))
+            ;; Add house edge to balance (only on wins, not draws)
+            (if (is-eq outcome BET_OUTCOME_WIN)
+              (add-to-house-balance (calculate-house-fee bet-amount))
+              true))
+          ;; On loss, entire bet goes to house
+          (add-to-house-balance bet-amount))
+        
+        ;; Store final price data
+        (store-price-data final-price (get-current-timestamp))
+        
+        (ok outcome)))))
+
+;; Oracle function to update price data
+(define-public (update-price (price uint) (timestamp uint))
+  (begin
+    (asserts! (is-authorized-oracle) ERR_UNAUTHORIZED)
+    (asserts! (is-price-data-fresh timestamp) ERR_ORACLE_ERROR)
+    (store-price-data price timestamp)
+    (ok true)))
+
+;; Batch resolve multiple bets (for efficiency) - simplified version
+(define-public (batch-resolve-bet (bet-id uint) (final-price uint))
+  (begin
+    (asserts! (is-authorized-oracle) ERR_UNAUTHORIZED)
+    (resolve-bet bet-id final-price)))
+
+;; Read-only functions for querying data
+
+;; Get bet details
+(define-read-only (get-bet-info (bet-id uint))
+  (map-get? bets { bet-id: bet-id }))
+
+;; Get user statistics
+(define-read-only (get-user-stats (user principal))
+  (map-get? user-stats { user: user }))
+
+;; Get user's active bets (simplified version)
+(define-read-only (get-user-active-bet-status (user principal) (bet-id uint))
+  (map-get? user-active-bets { user: user, bet-id: bet-id }))
+
+;; Get daily pool information
+(define-read-only (get-daily-pool (date uint))
+  (map-get? daily-pools { date: date }))
+
+;; Get current contract statistics
+(define-read-only (get-contract-stats)
+  {
+    total-bets: (var-get total-bets-created),
+    total-volume: (var-get total-volume),
+    house-balance: (var-get house-balance),
+    contract-paused: (var-get contract-paused),
+    current-bet-id: (var-get bet-id-nonce)
+  })
+
+;; Get latest price data
+(define-read-only (get-latest-price-info)
+  (get-latest-price))
+
+;; Check if a bet can be resolved
+(define-read-only (can-bet-be-resolved (bet-id uint))
+  (match (map-get? bets { bet-id: bet-id })
+    bet-data (can-resolve-bet bet-data)
+    false))
+
+;; Administrative functions
+
+;; Set oracle address (only owner)
+(define-public (set-oracle-address (oracle principal))
+  (begin
+    (asserts! (is-contract-owner) ERR_UNAUTHORIZED)
+    (var-set oracle-address (some oracle))
+    (ok true)))
+
+;; Pause/unpause contract (only owner)
+(define-public (set-contract-pause (paused bool) (reason (string-ascii 256)))
+  (begin
+    (asserts! (is-contract-owner) ERR_UNAUTHORIZED)
+    (var-set contract-paused paused)
+    (if paused
+      (let ((reason-id (var-get bet-id-nonce))) ;; Reuse nonce for reason IDs
+        (map-set pause-reasons { reason-id: reason-id }
+          {
+            reason: reason,
+            paused-at: (get-current-timestamp),
+            paused-by: tx-sender
+          })
+        (ok true))
+      (ok true))))
+
+;; Withdraw house balance (only owner)
+(define-public (withdraw-house-balance (amount uint))
+  (begin
+    (asserts! (is-contract-owner) ERR_UNAUTHORIZED)
+    (asserts! (<= amount (var-get house-balance)) ERR_INSUFFICIENT_BALANCE)
+    (var-set house-balance (- (var-get house-balance) amount))
+    (try! (as-contract (stx-transfer? amount tx-sender CONTRACT_OWNER)))
+    (ok true)))
+
+;; Update contract configuration
+(define-public (set-config (key (string-ascii 32)) (value uint))
+  (begin
+    (asserts! (is-contract-owner) ERR_UNAUTHORIZED)
+    (map-set contract-config { key: key } { value: value })
+    (ok true)))
+
+;; Get contract configuration
+(define-read-only (get-config (key (string-ascii 32)))
+  (map-get? contract-config { key: key }))
+
+;; Emergency functions
+
+;; Emergency resolve bet (owner only, for stuck bets)
+(define-public (emergency-resolve-bet (bet-id uint) (outcome uint) (payout uint))
+  (begin
+    (asserts! (is-contract-owner) ERR_UNAUTHORIZED)
+    (asserts! (var-get contract-paused) ERR_UNAUTHORIZED)
+    
+    (let ((bet-data (unwrap! (map-get? bets { bet-id: bet-id }) ERR_BET_NOT_FOUND)))
+      (asserts! (not (get resolved bet-data)) ERR_BET_ALREADY_RESOLVED)
+      
+      ;; Update bet
+      (map-set bets { bet-id: bet-id }
+        (merge bet-data {
+          outcome: outcome,
+          resolved: true,
+          resolved-at: (some (get-current-timestamp)),
+          payout: payout
+        }))
+      
+      ;; Handle payout if needed
+      (if (> payout u0)
+        (try! (as-contract (stx-transfer? payout tx-sender (get bettor bet-data))))
+        true)
+      
+      ;; Remove from active bets
+      (remove-user-active-bet (get bettor bet-data) bet-id)
+      
+      (ok true))))
+
+;; Utility function to get contract balance
+(define-read-only (get-contract-balance)
+  (stx-get-balance (as-contract tx-sender)))
