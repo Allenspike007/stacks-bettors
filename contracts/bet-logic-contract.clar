@@ -39,7 +39,103 @@
 (define-constant RESOLUTION_WINDOW u86400) ;; 24 hours window to resolve expired bets
 
 ;; data maps and vars
-;;
+
+;; Global state variables
+(define-data-var bet-id-nonce uint u0) ;; Auto-incrementing bet ID generator
+(define-data-var total-bets-created uint u0) ;; Total number of bets ever created
+(define-data-var total-volume uint u0) ;; Total betting volume in microSTX
+(define-data-var house-balance uint u0) ;; Contract's accumulated house edge fees
+(define-data-var contract-paused bool false) ;; Emergency pause mechanism
+(define-data-var oracle-address (optional principal) none) ;; Authorized oracle address
+
+;; Core bet data structure
+(define-map bets
+  { bet-id: uint }
+  {
+    bettor: principal,           ;; Address of the bettor
+    amount: uint,                ;; Bet amount in microSTX
+    prediction: uint,            ;; PREDICTION_RISE or PREDICTION_DROP
+    start-price: uint,           ;; STX price when bet was placed (in cents)
+    target-price: (optional uint), ;; Final STX price for resolution (in cents)
+    start-time: uint,            ;; Block height when bet was created
+    end-time: uint,              ;; Block height when bet expires
+    duration: uint,              ;; Duration in seconds
+    outcome: uint,               ;; BET_OUTCOME_* constants
+    resolved: bool,              ;; Whether bet has been resolved
+    resolved-at: (optional uint), ;; Block height when resolved
+    payout: uint                 ;; Calculated payout amount
+  }
+)
+
+;; User statistics and history
+(define-map user-stats
+  { user: principal }
+  {
+    total-bets: uint,            ;; Number of bets placed by user
+    total-wagered: uint,         ;; Total amount wagered
+    total-won: uint,             ;; Total amount won
+    total-lost: uint,            ;; Total amount lost
+    win-streak: uint,            ;; Current winning streak
+    best-streak: uint,           ;; Best winning streak ever
+    last-bet-time: uint          ;; Last time user placed a bet
+  }
+)
+
+;; User's active bets (for quick lookup)
+(define-map user-active-bets
+  { user: principal, bet-id: uint }
+  { active: bool }
+)
+
+;; Price oracle data
+(define-map price-data
+  { timestamp: uint }
+  {
+    price: uint,                 ;; STX price in cents
+    source: principal,           ;; Oracle that provided the price
+    block-height: uint,          ;; Block when price was recorded
+    confidence: uint             ;; Confidence level (0-10000 basis points)
+  }
+)
+
+;; Betting pool data for risk management
+(define-map daily-pools
+  { date: uint }                 ;; Unix timestamp (day start)
+  {
+    total-rise-bets: uint,       ;; Total amount bet on price rise
+    total-drop-bets: uint,       ;; Total amount bet on price drop
+    total-volume: uint,          ;; Total daily volume
+    bet-count: uint              ;; Number of bets for the day
+  }
+)
+
+;; Contract configuration (admin settable)
+(define-map contract-config
+  { key: (string-ascii 32) }
+  { value: uint }
+)
+
+;; Withdrawal requests (for large payouts)
+(define-map withdrawal-requests
+  { request-id: uint }
+  {
+    user: principal,
+    amount: uint,
+    bet-id: uint,
+    requested-at: uint,
+    processed: bool
+  }
+)
+
+;; Emergency pause reasons
+(define-map pause-reasons
+  { reason-id: uint }
+  {
+    reason: (string-ascii 256),
+    paused-at: uint,
+    paused-by: principal
+  }
+)
 
 ;; private functions
 ;;
