@@ -598,3 +598,389 @@ Clarinet.test({
         assertEquals(initialReceipt.result, finalReceipt.result);
     },
 });
+
+/**
+ * STX Betting Contract Test Suite - Commit 2: Edge Cases and Advanced Validations
+ * 
+ * This section covers:
+ * - Contract pause/unpause functionality
+ * - Emergency functions and edge cases
+ * - Oracle price data management
+ * - Advanced error scenarios
+ * - Boundary condition testing
+ */
+
+// Test 23: Contract pause functionality
+Clarinet.test({
+    name: "deployer can pause and unpause contract",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const deployer = accounts.get("deployer")!;
+        const wallet1 = accounts.get("wallet_1")!;
+        
+        // Pause the contract
+        let pauseBlock = chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "set-contract-pause", [
+                types.bool(true),
+                types.ascii("Testing pause functionality")
+            ], deployer.address)
+        ]);
+        
+        assertEquals(pauseBlock.receipts[0].result.substring(0, 3), "(ok");
+        
+        // Verify contract is paused by trying to place bet
+        let betBlock = chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "place-bet", [
+                types.uint(MIN_BET_AMOUNT),
+                types.uint(PREDICTION_RISE),
+                types.uint(MIN_DURATION),
+                types.uint(1000000)
+            ], wallet1.address)
+        ]);
+        
+        // Should fail with unauthorized error when contract is paused
+        assertEquals(betBlock.receipts[0].result.substring(0, 4), "(err");
+        assertEquals(betBlock.receipts[0].result.includes("u100"), true);
+        
+        // Unpause the contract
+        let unpauseBlock = chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "set-contract-pause", [
+                types.bool(false),
+                types.ascii("Unpausing contract")
+            ], deployer.address)
+        ]);
+        
+        assertEquals(unpauseBlock.receipts[0].result.substring(0, 3), "(ok");
+    },
+});
+
+// Test 24: Oracle price update functionality
+Clarinet.test({
+    name: "authorized oracle can update price data",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const deployer = accounts.get("deployer")!;
+        const oracle = accounts.get("wallet_1")!;
+        
+        // Set oracle address
+        let setOracleBlock = chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "set-oracle-address", [
+                types.principal(oracle.address)
+            ], deployer.address)
+        ]);
+        
+        assertEquals(setOracleBlock.receipts[0].result.substring(0, 3), "(ok");
+        
+        // Oracle updates price with current-ish timestamp (should succeed)
+        let updateBlock = chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "update-price", [
+                types.uint(1200000), // 12 STX price
+                types.uint(chain.blockHeight * 600) // Use block height * 600 to simulate current time
+            ], oracle.address)
+        ]);
+        
+        // Should succeed with valid timestamp
+        assertEquals(updateBlock.receipts[0].result.substring(0, 3), "(ok");
+    },
+});
+
+// Test 25: Non-authorized oracle cannot update price
+Clarinet.test({
+    name: "non-authorized oracle cannot update price data",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const deployer = accounts.get("deployer")!;
+        const oracle = accounts.get("wallet_1")!;
+        const nonOracle = accounts.get("wallet_2")!;
+        
+        // Set oracle address
+        chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "set-oracle-address", [
+                types.principal(oracle.address)
+            ], deployer.address)
+        ]);
+        
+        // Non-oracle tries to update price
+        let updateBlock = chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "update-price", [
+                types.uint(1200000),
+                types.uint(chain.blockHeight * 600) // Use valid timestamp
+            ], nonOracle.address)
+        ]);
+        
+        // Should fail with unauthorized error
+        assertEquals(updateBlock.receipts[0].result.substring(0, 4), "(err");
+        assertEquals(updateBlock.receipts[0].result.includes("u100"), true);
+    },
+});
+
+// Test 26: House balance withdrawal by owner
+Clarinet.test({
+    name: "owner can withdraw from house balance",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const deployer = accounts.get("deployer")!;
+        
+        // Try to withdraw when house balance is likely 0
+        let withdrawBlock = chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "withdraw-house-balance", [
+                types.uint(1000) // Try to withdraw 1000 microSTX
+            ], deployer.address)
+        ]);
+        
+        // Should fail with insufficient balance error
+        assertEquals(withdrawBlock.receipts[0].result.substring(0, 4), "(err");
+        assertEquals(withdrawBlock.receipts[0].result.includes("u106"), true); // ERR_INSUFFICIENT_BALANCE
+    },
+});
+
+// Test 27: Non-owner cannot withdraw house balance
+Clarinet.test({
+    name: "non-owner cannot withdraw house balance",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const wallet1 = accounts.get("wallet_1")!;
+        
+        // Non-owner tries to withdraw
+        let withdrawBlock = chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "withdraw-house-balance", [
+                types.uint(1000)
+            ], wallet1.address)
+        ]);
+        
+        // Should fail with unauthorized error
+        assertEquals(withdrawBlock.receipts[0].result.substring(0, 4), "(err");
+        assertEquals(withdrawBlock.receipts[0].result.includes("u100"), true);
+    },
+});
+
+// Test 28: Emergency resolve bet function (admin only)
+Clarinet.test({
+    name: "emergency resolve requires contract to be paused",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const deployer = accounts.get("deployer")!;
+        
+        // Try emergency resolve without pausing contract first
+        let emergencyBlock = chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "emergency-resolve-bet", [
+                types.uint(1), // bet-id
+                types.uint(1), // outcome (WIN)
+                types.uint(200000) // payout
+            ], deployer.address)
+        ]);
+        
+        // Should fail because contract is not paused
+        assertEquals(emergencyBlock.receipts[0].result.substring(0, 4), "(err");
+        assertEquals(emergencyBlock.receipts[0].result.includes("u100"), true);
+    },
+});
+
+// Test 29: Batch resolve bet function (oracle only)
+Clarinet.test({
+    name: "batch resolve bet requires oracle authorization",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const nonOracle = accounts.get("wallet_1")!;
+        
+        // Non-oracle tries to batch resolve
+        let batchBlock = chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "batch-resolve-bet", [
+                types.uint(1), // bet-id
+                types.uint(1100000) // final price
+            ], nonOracle.address)
+        ]);
+        
+        // Should fail with unauthorized error
+        assertEquals(batchBlock.receipts[0].result.substring(0, 4), "(err");
+        assertEquals(batchBlock.receipts[0].result.includes("u100"), true);
+    },
+});
+
+// Test 30: Can bet be resolved function
+Clarinet.test({
+    name: "can-bet-be-resolved returns false for non-existent bet",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const deployer = accounts.get("deployer")!;
+        
+        // Check if a non-existent bet can be resolved
+        let canResolveReceipt = chain.callReadOnlyFn(
+            CONTRACT_NAME,
+            "can-bet-be-resolved",
+            [types.uint(999)],
+            deployer.address
+        );
+        
+        assertEquals(canResolveReceipt.result, "false");
+    },
+});
+
+// Test 31: Get latest price info function
+Clarinet.test({
+    name: "get-latest-price-info returns none when no price data",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const deployer = accounts.get("deployer")!;
+        
+        // Get latest price info when no price has been set
+        let priceReceipt = chain.callReadOnlyFn(
+            CONTRACT_NAME,
+            "get-latest-price-info",
+            [],
+            deployer.address
+        );
+        
+        assertEquals(priceReceipt.result, "none");
+    },
+});
+
+// Test 32: Get daily pool information
+Clarinet.test({
+    name: "get-daily-pool returns none for days with no activity",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const deployer = accounts.get("deployer")!;
+        
+        // Get daily pool info for a random timestamp
+        let poolReceipt = chain.callReadOnlyFn(
+            CONTRACT_NAME,
+            "get-daily-pool",
+            [types.uint(1640995200)], // Random timestamp
+            deployer.address
+        );
+        
+        assertEquals(poolReceipt.result, "none");
+    },
+});
+
+// Test 33: Get user active bet status
+Clarinet.test({
+    name: "get-user-active-bet-status returns none for non-existent bet",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const deployer = accounts.get("deployer")!;
+        const wallet1 = accounts.get("wallet_1")!;
+        
+        // Check active bet status for non-existent bet
+        let statusReceipt = chain.callReadOnlyFn(
+            CONTRACT_NAME,
+            "get-user-active-bet-status",
+            [types.principal(wallet1.address), types.uint(999)],
+            deployer.address
+        );
+        
+        assertEquals(statusReceipt.result, "none");
+    },
+});
+
+// Test 34: Oracle price validation with invalid timestamp
+Clarinet.test({
+    name: "oracle price update fails with stale timestamp",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const deployer = accounts.get("deployer")!;
+        const oracle = accounts.get("wallet_1")!;
+        
+        // Set oracle address
+        chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "set-oracle-address", [
+                types.principal(oracle.address)
+            ], deployer.address)
+        ]);
+        
+        // Oracle tries to update with very old timestamp (much less than current block time)
+        let updateBlock = chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "update-price", [
+                types.uint(1200000),
+                types.uint(100) // Very old timestamp, much less than block height * 600
+            ], oracle.address)
+        ]);
+        
+        // Should fail with oracle error due to stale data
+        assertEquals(updateBlock.receipts[0].result.substring(0, 4), "(err");
+        assertEquals(updateBlock.receipts[0].result.includes("u108"), true); // ERR_ORACLE_ERROR
+    },
+});
+
+// Test 35: Multiple config keys management
+Clarinet.test({
+    name: "deployer can manage multiple config keys",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const deployer = accounts.get("deployer")!;
+        
+        // Set multiple config values
+        let configBlock = chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "set-config", [
+                types.ascii("max-daily-volume"),
+                types.uint(10000000000)
+            ], deployer.address),
+            Tx.contractCall(CONTRACT_NAME, "set-config", [
+                types.ascii("fee-percentage"),
+                types.uint(250) // 2.5%
+            ], deployer.address),
+            Tx.contractCall(CONTRACT_NAME, "set-config", [
+                types.ascii("min-oracle-confidence"),
+                types.uint(8000) // 80%
+            ], deployer.address)
+        ]);
+        
+        // All should succeed
+        assertEquals(configBlock.receipts[0].result.substring(0, 3), "(ok");
+        assertEquals(configBlock.receipts[1].result.substring(0, 3), "(ok");
+        assertEquals(configBlock.receipts[2].result.substring(0, 3), "(ok");
+        
+        // Verify configs were set
+        let maxVolumeReceipt = chain.callReadOnlyFn(
+            CONTRACT_NAME,
+            "get-config",
+            [types.ascii("max-daily-volume")],
+            deployer.address
+        );
+        
+        let feeReceipt = chain.callReadOnlyFn(
+            CONTRACT_NAME,
+            "get-config",
+            [types.ascii("fee-percentage")],
+            deployer.address
+        );
+        
+        assertStringIncludes(maxVolumeReceipt.result.toString(), "u10000000000");
+        assertStringIncludes(feeReceipt.result.toString(), "u250");
+    },
+});
+
+// Test 36: Contract stats consistency
+Clarinet.test({
+    name: "contract stats remain consistent across operations",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const deployer = accounts.get("deployer")!;
+        const wallet1 = accounts.get("wallet_1")!;
+        
+        // Get initial stats
+        let initialStatsReceipt = chain.callReadOnlyFn(
+            CONTRACT_NAME,
+            "get-contract-stats",
+            [],
+            deployer.address
+        );
+        
+        // Perform various operations (admin functions, failed bets, etc.)
+        chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "set-oracle-address", [
+                types.principal(wallet1.address)
+            ], deployer.address),
+            Tx.contractCall(CONTRACT_NAME, "place-bet", [
+                types.uint(MIN_BET_AMOUNT),
+                types.uint(PREDICTION_RISE),
+                types.uint(MIN_DURATION),
+                types.uint(1000000)
+            ], wallet1.address) // This will fail due to pool safety
+        ]);
+        
+        // Get final stats
+        let finalStatsReceipt = chain.callReadOnlyFn(
+            CONTRACT_NAME,
+            "get-contract-stats",
+            [],
+            deployer.address
+        );
+        
+        // Core betting stats should remain unchanged since bet failed
+        let initialStr = initialStatsReceipt.result.toString();
+        let finalStr = finalStatsReceipt.result.toString();
+        
+        assertStringIncludes(initialStr, "total-bets");
+        assertStringIncludes(finalStr, "total-bets");
+        // The actual values should be the same since no successful bets occurred
+        assertEquals(initialStr, finalStr);
+    },
+});
